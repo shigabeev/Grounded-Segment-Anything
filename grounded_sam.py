@@ -3,7 +3,9 @@ import sys
 import argparse
 import numpy as np
 import torch
+import shutil
 from PIL import Image
+from tqdm.auto import tqdm
 import cv2
 from torchvision.ops import box_convert
 from huggingface_hub import hf_hub_download
@@ -56,6 +58,7 @@ class GroundedSAM:
 
     def process_image(self, image_path, text_prompt, box_threshold, text_threshold):
         image_source, image = load_image(image_path)
+        image_height, image_width, _ = image_source.shape
 
         boxes, logits, phrases = predict(
             model=self.groundingdino_model,
@@ -68,13 +71,12 @@ class GroundedSAM:
 
         # Check if any objects were detected
         if len(boxes) == 0:
-            print(f"No objects detected in {image_path}. Returning original image.")
-            return Image.fromarray(image_source)
+            print(f"No objects detected in {image_path}.")
+            return False
 
         self.sam_predictor.set_image(image_source)
 
-        H, W, _ = image_source.shape
-        boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([W, H, W, H])
+        boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes) * torch.Tensor([image_width, image_height, image_width, image_height])
         transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_xyxy, image_source.shape[:2]).to(DEVICE)
 
         masks, _, _ = self.sam_predictor.predict_torch(
@@ -85,96 +87,183 @@ class GroundedSAM:
         )
 
         image_mask = masks[0][0].cpu().numpy()
-        kernel = np.ones((5,5), np.uint8)
+        
+        # Check if the mask is valid for a watermark
+        if not self.is_valid_watermark_mask(image_mask, image_height, image_width):
+            print(f"Invalid mask detected in {image_path}.")
+            return False
+
+
+        kernel = np.ones((15,15), np.uint8)
         dilated_mask = cv2.dilate(image_mask.astype(np.uint8), kernel, iterations=2)
         image_mask = dilated_mask.astype(bool)
 
         image_source_pil = Image.fromarray(image_source)
         image_mask_pil = Image.fromarray(image_mask)
 
-        expanded_bbox = self.get_expanded_bbox(image_mask_pil, image_source_pil.size)
-        image_source_for_inpaint, image_mask_for_inpaint = self.prepare_for_inpainting(image_source_pil, image_mask_pil, expanded_bbox)
+        # Calculate the crop size based on the watermark proportion
+        crop_size = self.calculate_crop_size(image_mask_pil, image_source_pil.size)
+        
+        # Crop and resize the image and mask only if necessary
+        image_for_inpaint, mask_for_inpaint, crop_box = self.prepare_for_inpainting(image_source_pil, image_mask_pil, crop_size)
 
         generator = torch.Generator(device="cuda").manual_seed(0)
-        prompt = "seamless background, continuous texture"
+        prompt = "A portrait of a beautiful asian woman"
+        negative_prompt = "watermark, logo, brand, text"
 
-        image_inpainting = self.inpaint_image(self.pipe, prompt, image_source_for_inpaint, image_mask_for_inpaint, generator)
+        image_inpainting = self.inpaint_image(self.pipe, prompt, negative_prompt, image_for_inpaint, mask_for_inpaint, generator)
 
-        final_image = self.paste_inpainted_region(image_source_pil, image_inpainting, expanded_bbox)
-
-        if max(final_image.size) > 2048:
-            final_image.thumbnail((2048, 2048), Image.LANCZOS)
+        final_image = self.paste_inpainted_region(image_source_pil, image_inpainting, crop_box)
 
         return final_image
 
     @staticmethod
-    def get_expanded_bbox(mask_pil, image_size, target_size=2048):
+    def calculate_crop_size(mask_pil, image_size):
         mask_bbox = mask_pil.getbbox()
         W, H = image_size
-        expand_factor = min(target_size / max(mask_bbox[2] - mask_bbox[0], mask_bbox[3] - mask_bbox[1]), 1)
+        
+        mask_width = mask_bbox[2] - mask_bbox[0]
+        mask_height = mask_bbox[3] - mask_bbox[1]
+        
+        # Calculate the proportion of the image occupied by the watermark
+        width_proportion = mask_width / W
+        height_proportion = mask_height / H
+        
+        # Estimate crop size based on watermark proportion
+        crop_width = min(int(mask_width / width_proportion), 2048)
+        crop_height = min(int(mask_height / height_proportion), 2048)
+        
+        return (crop_width, crop_height)
+
+    @staticmethod
+    def get_expanded_bbox(mask_pil, image_size, max_size=2048*2048):
+        mask_bbox = mask_pil.getbbox()
+        W, H = image_size
+        
+        # Calculate the aspect ratio of the mask
+        mask_width = mask_bbox[2] - mask_bbox[0]
+        mask_height = mask_bbox[3] - mask_bbox[1]
+        aspect_ratio = mask_width / mask_height
+
+        # Determine the new dimensions while maintaining the aspect ratio
+        if aspect_ratio > 1:  # Wider than tall
+            new_width = min(int(np.sqrt(max_size * aspect_ratio)), W)
+            new_height = int(new_width / aspect_ratio)
+        else:  # Taller than wide
+            new_height = min(int(np.sqrt(max_size / aspect_ratio)), H)
+            new_width = int(new_height * aspect_ratio)
+
+        # Calculate the expansion factors
+        expand_x = (new_width - mask_width) / 2
+        expand_y = (new_height - mask_height) / 2
+
+        # Calculate the new bounding box
         expanded_bbox = [
-            int(mask_bbox[0] - (1024 / expand_factor - (mask_bbox[2] - mask_bbox[0])) / 2),
-            int(mask_bbox[1] - (1024 / expand_factor - (mask_bbox[3] - mask_bbox[1])) / 2),
-            int(mask_bbox[2] + (1024 / expand_factor - (mask_bbox[2] - mask_bbox[0])) / 2),
-            int(mask_bbox[3] + (1024 / expand_factor - (mask_bbox[3] - mask_bbox[1])) / 2)
-        ]
-        return [
-            max(0, expanded_bbox[0]),
-            max(0, expanded_bbox[1]),
-            min(W, expanded_bbox[2]),
-            min(H, expanded_bbox[3])
+            int(max(0, mask_bbox[0] - expand_x)),
+            int(max(0, mask_bbox[1] - expand_y)),
+            int(min(W, mask_bbox[2] + expand_x)),
+            int(min(H, mask_bbox[3] + expand_y))
         ]
 
-    @staticmethod
-    def prepare_for_inpainting(image_pil, mask_pil, bbox):
-        image_for_inpaint = image_pil.crop(bbox)
-        mask_for_inpaint = mask_pil.crop(bbox)
-        image_for_inpaint = image_for_inpaint.resize((1024, 1024), Image.LANCZOS)
-        mask_for_inpaint = mask_for_inpaint.resize((1024, 1024), Image.NEAREST)
-        return image_for_inpaint, mask_for_inpaint
+        return expanded_bbox
 
     @staticmethod
-    def inpaint_image(pipe, prompt, image, mask, generator):
+    def prepare_for_inpainting(image_pil, mask_pil, crop_size):
+        W, H = image_pil.size
+        crop_width, crop_height = crop_size
+        
+        # Calculate crop box
+        mask_bbox = mask_pil.getbbox()
+        center_x = (mask_bbox[0] + mask_bbox[2]) // 2
+        center_y = (mask_bbox[1] + mask_bbox[3]) // 2
+        
+        left = max(0, center_x - crop_width // 2)
+        top = max(0, center_y - crop_height // 2)
+        right = min(W, left + crop_width)
+        bottom = min(H, top + crop_height)
+        
+        crop_box = (left, top, right, bottom)
+        
+        # Crop image and mask
+        image_for_inpaint = image_pil.crop(crop_box)
+        mask_for_inpaint = mask_pil.crop(crop_box)
+        
+        # Resize only if necessary
+        if crop_width > 2048 or crop_height > 2048:
+            image_for_inpaint.thumbnail((2048, 2048), Image.LANCZOS)
+            mask_for_inpaint = mask_for_inpaint.resize(image_for_inpaint.size, Image.NEAREST)
+        
+        # Ensure dimensions are divisible by 8
+        width, height = image_for_inpaint.size
+        new_width = (width // 8) * 8
+        new_height = (height // 8) * 8
+        
+        if (width, height) != (new_width, new_height):
+            image_for_inpaint = image_for_inpaint.resize((new_width, new_height), Image.LANCZOS)
+            mask_for_inpaint = mask_for_inpaint.resize((new_width, new_height), Image.NEAREST)
+        
+        return image_for_inpaint, mask_for_inpaint, crop_box
+
+    @staticmethod
+    def inpaint_image(pipe, prompt, negative_prompt, image, mask, generator):
         return pipe(
             prompt=prompt,
+            negative_prompt=negative_prompt,
             image=image,
             mask_image=mask,
             guidance_scale=8.0,
             num_inference_steps=20,
             strength=0.99,
             generator=generator,
-            added_cond_kwargs={"text_embeds":None}
+            height=image.size[1],
+            width=image.size[0]
         ).images[0]
 
     @staticmethod
-    def paste_inpainted_region(original_image, inpainted_image, bbox):
+    def paste_inpainted_region(original_image, inpainted_image, crop_box):
         result = original_image.copy()
-        inpainted_image = inpainted_image.resize((bbox[2] - bbox[0], bbox[3] - bbox[1]), Image.LANCZOS)
-        result.paste(inpainted_image, (bbox[0], bbox[1]))
+        result.paste(inpainted_image, (crop_box[0], crop_box[1]))
         return result
+
+    @staticmethod
+    def is_valid_watermark_mask(mask, height, width, max_mask_percentage = 0.10):
+        mask_percentage = np.sum(mask) / (height * width)
+        return mask_percentage <= max_mask_percentage
+
 
 def process_folder(input_folder, output_folder, model):
     os.makedirs(output_folder, exist_ok=True)
     
-    for filename in os.listdir(input_folder):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
-            input_path = os.path.join(input_folder, filename)
-            output_path = os.path.join(output_folder, f"{os.path.splitext(filename)[0]}_inpainted.png")
-            
-            try:
-                result_image = model.process_image(
-                    input_path,
-                    text_prompt="watermark, logo, brand, text",
-                    box_threshold=0.3,
-                    text_threshold=0.25
-                )
-                if result_image.size == Image.open(input_path).size:
-                    print(f"Skipped {filename} - No objects detected")
-                else:
-                    result_image.save(output_path)
-                    print(f"Processed {filename}")
-            except Exception as e:
-                print(f"Error processing {filename}: {str(e)}")
+    # Get a list of all files in the input folder
+    all_files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif'))]
+    
+    # Get a list of already processed files
+    processed_files = [f.replace('_inpainted.png', '') for f in os.listdir(output_folder) if f.endswith('_inpainted.png')]
+    
+    # Filter out already processed files
+    files_to_process = [f for f in all_files if os.path.splitext(f)[0] not in processed_files]
+    
+    for filename in tqdm(files_to_process):
+        input_path = os.path.join(input_folder, filename)
+        output_path = os.path.join(output_folder, f"{os.path.splitext(filename)[0]}_inpainted.png")
+        
+        try:
+            result_image = model.process_image(
+                input_path,
+                text_prompt="watermark, logo, brand, text",
+                box_threshold=0.3,
+                text_threshold=0.25
+            )
+            if result_image is False:
+                # Copy the original file with a different suffix
+                original_output_path = os.path.join(output_folder, f"{os.path.splitext(filename)[0]}_original{os.path.splitext(filename)[1]}")
+                shutil.copy2(input_path, original_output_path)
+                print(f"Skipped {filename} - No objects detected")
+            else:
+                result_image.save(output_path)
+                print(f"Processed {filename}")
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser(description="Process images in a folder using Grounded-SAM")
